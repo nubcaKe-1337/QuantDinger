@@ -48,11 +48,14 @@ from app.services.strategy_runtime.timeframes import (
 from app.services.strategy_v2 import (
     OrderIntent,
     StrategyV2BacktestService,
-    StrategyV2LiveSession,
-    compile_strategy_v2,
+    inspect_strategy_v2,
 )
 from app.services.strategy_v2.live_execution import LiveOrderRequest, StrategyV2OrderGateway
 from app.services.strategy_v2.instruments import instrument_key_from_metadata, parse_instrument
+from app.services.strategy_v2.sandbox import (
+    IsolatedStrategyV2LiveSession,
+    StrategySandboxTerminatedError,
+)
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
 from app.utils.numeric_precision import format_decimal
@@ -63,6 +66,9 @@ logger = get_logger(__name__)
 
 MIN_LIVE_ORDER_NOTIONAL = 1.0
 __all__ = ["TradingExecutor", "live_history_days"]
+# Compatibility name for internal integrations and tests. The implementation
+# is the credential-free process proxy, never the in-process runtime session.
+StrategyV2LiveSession = IsolatedStrategyV2LiveSession
 
 
 def _runtime_position_key(symbol: object, position_side: object = "") -> str:
@@ -739,12 +745,13 @@ class TradingExecutor:
             )
         event_subscription_repository = None
         state_store: RuntimeStateStore | None = None
+        session: StrategyV2LiveSession | None = None
         try:
             strategy = self._load_strategy(strategy_id)
             if not strategy:
                 raise RuntimeError("strategyV2.strategyNotFound")
             source_version_id, code = self._load_source(strategy)
-            program = compile_strategy_v2(code)
+            program = inspect_strategy_v2(code)
             user_id = int(strategy.get("user_id") or 0)
             trading_config = _json_object(strategy.get("trading_config"))
             exchange_config = _json_object(strategy.get("exchange_config"))
@@ -887,6 +894,10 @@ class TradingExecutor:
                 "commission",
                 self._to_ratio(trading_config.get("commission") or 0.001),
             )
+            initial_universe_members = resolve_universe(
+                program.manifest.universe.reference,
+                _latest_frame_timestamp(frames) or pd.Timestamp.now(tz="UTC"),
+            )
             session = StrategyV2LiveSession(
                 code=code,
                 frames=frames,
@@ -894,8 +905,12 @@ class TradingExecutor:
                 initial_capital=initial_capital,
                 params=runtime_params,
                 deployment_risk=trading_config.get("deployment_risk"),
-                universe_resolver=resolve_universe,
+                universe_members=initial_universe_members,
                 schedule_timezone=self._load_schedule_timezone(user_id),
+                program=program,
+                max_memory_mb=int(
+                    os.getenv("STRATEGY_RUNTIME_SANDBOX_MEMORY_MB", "2048") or 2048
+                ),
             )
             primary = candidates[0]
             runtime_run = ensure_strategy_run(
@@ -1008,7 +1023,7 @@ class TradingExecutor:
                 _env_enabled("BAR_CLOSE_EVENT_SCHEDULER_ENABLED", default=True)
                 and daily_policy is None
                 and bot_type not in {"grid", "martingale", "layered_martingale"}
-                and not callable(program.namespace.get("on_price_tick"))
+                and not program.has_handler("on_price_tick")
                 and supports_bar_close_events(frequency, candidates)
             )
             stream_keys: set[BarStreamKey] = set()
@@ -1463,6 +1478,10 @@ class TradingExecutor:
                                 intents, messages, timestamp = session.process(
                                     frames,
                                     frequency_frames=frequency_frames,
+                                    universe_members=resolve_universe(
+                                        program.manifest.universe.reference,
+                                        latest_frame_timestamp or pd.Timestamp.now(tz="UTC"),
+                                    ),
                                 )
                                 intents = [
                                     intent
@@ -1620,7 +1639,7 @@ class TradingExecutor:
                             status="degraded",
                             last_error=str(exc),
                         )
-                        if consecutive_errors >= 5:
+                        if isinstance(exc, StrategySandboxTerminatedError) or consecutive_errors >= 5:
                             raise RuntimeError(f"strategyV2.repeatedRuntimeFailure:{exc}") from exc
                 remaining = wait_seconds - (time.monotonic() - cycle_started)
                 yield max(0.0, remaining)
@@ -1643,6 +1662,14 @@ class TradingExecutor:
                 clear_signal_state(run_id)
             if state_store is not None:
                 state_store.flush()
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    logger.exception(
+                        "Strategy sandbox cleanup failed: strategy=%s",
+                        strategy_id,
+                    )
             for subscription in bar_subscriptions:
                 subscription.close()
             if event_subscription_repository is not None:
